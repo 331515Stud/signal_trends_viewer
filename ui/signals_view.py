@@ -1,3 +1,5 @@
+import datetime
+
 from PyQt6.QtWidgets import (
     QMdiSubWindow, QToolBar, QScrollArea, QToolButton, QLabel, QSlider,
     QCheckBox, QSizePolicy, QMessageBox, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
@@ -80,7 +82,7 @@ def adc_to_physical(adc_shifted: np.ndarray, mult: float, div: float) -> np.ndar
 
 
 # =============================================================================
-# УТИЛИТА ПАРСИНГА TIMESTAMP
+# УТИЛИТА ПАРСИНГА TIMESTAMP (единая для всего проекта)
 # =============================================================================
 def parse_timestamp_to_ms(value) -> int:
     """
@@ -114,9 +116,7 @@ def parse_timestamp_to_ms(value) -> int:
 
 
 def parse_timestamps_column(series: pd.Series) -> pd.Series:
-    """
-    Универсальный парсинг колонки timestamp в миллисекунды.
-    """
+    """Универсальный парсинг колонки timestamp в миллисекунды."""
     # Сначала пробуем как числа
     numeric = pd.to_numeric(series, errors='coerce')
 
@@ -141,14 +141,14 @@ class CsvV2RecordLoader(QThread):
         super().__init__(parent)
         self.file_path = file_path
         self.rec_num = rec_num
-        self.timestamp = timestamp
+        self.timestamp = timestamp  # Unix ms
 
     def run(self):
         try:
             df = pd.read_csv(self.file_path, sep=';', encoding='utf-8', low_memory=False)
 
             if self.timestamp is not None:
-                # Ищем по timestamp - используем универсальный парсинг
+                # Ищем по timestamp (Unix ms) - используем универсальный парсинг
                 df['timestamp_ms'] = parse_timestamps_column(df['timestamp'])
                 idx = (df['timestamp_ms'] - self.timestamp).abs().idxmin()
             else:
@@ -157,9 +157,11 @@ class CsvV2RecordLoader(QThread):
 
             row = df.iloc[idx]
 
-            # Формируем dict в формате совместимом с pdb.LogRecord
+            # Сохраняем исходную строку datetime для отображения
+            raw_timestamp = str(row['timestamp']).strip()
             record = {
-                'timestamp': parse_timestamp_to_ms(row['timestamp']),
+                'timestamp': parse_timestamp_to_ms(row['timestamp']),  # Unix ms
+                'datetime_str': raw_timestamp,  # исходная строка из CSV
                 'chunkID': str(row.get('chunkID', '')),
                 'standID': str(row.get('standID', '')),
                 'scenario_code': str(row.get('scenario_code', '')),
@@ -240,7 +242,7 @@ class CsvV2ListLoader(QThread):
         try:
             df = pd.read_csv(self.file_path, sep=';', encoding='utf-8', low_memory=False)
 
-            # Универсальный парсинг timestamp
+            # Универсальный парсинг timestamp в Unix ms
             df['timestamp_ms'] = parse_timestamps_column(df['timestamp'])
             df = df[df['timestamp_ms'] > 0]
             timestamps = df['timestamp_ms'].astype('int64').tolist()
@@ -303,7 +305,7 @@ class PlotContainer(QWidget):
 # ОСНОВНОЙ КЛАСС
 # =============================================================================
 class SignalsView_subwindow(BaseModule):
-    timestamp_changed = pyqtSignal(int)
+    timestamp_changed = pyqtSignal(int)  # Unix ms
 
     def __init__(self, bus, parent=None):
         super().__init__(bus, parent)
@@ -312,11 +314,11 @@ class SignalsView_subwindow(BaseModule):
         self.setWindowTitle("Просмотр сигналов")
         self.setMinimumWidth(100)
 
-        self.current_current_table_timestamp_list = []
+        self.current_current_table_timestamp_list = []  # Список Unix ms
         self.current_rec_num = 0
         self.current_device = ""
         self.colnameList = []
-        self.channel_boolmask = [True] * 6  # 6 каналов для v2 (было 7)
+        self.channel_boolmask = [True] * 6  # 6 каналов для v2
         self.current_data = {}
         self.current_freq_range = (-1, -1)
         self.show_grid = False
@@ -326,7 +328,7 @@ class SignalsView_subwindow(BaseModule):
         self.csv_file_path = None
 
         # === СОХРАНЕНИЕ МАСШТАБА ТОКА ===
-        self.current_scale_limit = None  # Сохранённое значение масштаба тока (None = авто)
+        self.current_scale_limit = None
 
         self.size_policy = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
@@ -339,7 +341,7 @@ class SignalsView_subwindow(BaseModule):
         self.scrollArea = QScrollArea()
         self.scrollArea.setWidgetResizable(True)
 
-        self.plot_container = PlotContainer(num_channels=6)  # 6 каналов для v2
+        self.plot_container = PlotContainer(num_channels=6)
         self.scrollArea.setWidget(self.plot_container)
 
         main_layout = QVBoxLayout()
@@ -566,7 +568,7 @@ class SignalsView_subwindow(BaseModule):
                 self.list_loader.start()
 
     def on_csv_list_loaded(self, result):
-        """Получен список timestamp'ов из CSV."""
+        """Получен список timestamp'ов (Unix ms) из CSV."""
         self.current_current_table_timestamp_list = result['timestamps']
         self.update_button_states()
 
@@ -795,14 +797,14 @@ class SignalsView_subwindow(BaseModule):
         except Exception as e:
             logging.error(f"Ошибка в on_record_list: {e}")
 
-    def on_trends_cursor_moved(self, timestamp):
+    def on_trends_cursor_moved(self, timestamp_ms):
+        """
+        Получен Unix timestamp (ms) от trends_view.
+        Ищем ближайший в списке и загружаем соответствующую запись.
+        """
         try:
-            logging.info(f"Получен timestamp от трендов: {timestamp}")
-            if self.data_source == 'csv_v2' and self.csv_file_path:
-                # Для CSV ищем ближайший timestamp и загружаем
-                self.set_current_rec_num_by_timestamp(timestamp)
-            else:
-                self.set_current_rec_num_by_timestamp(timestamp)
+            logging.info(f"Получен timestamp от трендов: {timestamp_ms} (Unix ms)")
+            self.set_current_rec_num_by_timestamp(timestamp_ms)
         except Exception as e:
             logging.error(f"Ошибка в on_trends_cursor_moved: {e}")
 
@@ -824,7 +826,7 @@ class SignalsView_subwindow(BaseModule):
 
             try:
                 timestamp = self.current_data.get('timestamp', 0)
-                datetime_obj = pdb.datetime_from_timestamp(timestamp)
+                datetime_obj = datetime.datetime.fromtimestamp(timestamp / 1000.0)
                 filename = f"{self.current_device}_{datetime_obj.strftime('%Y%m%d_%H%M%S')}.bin"
 
                 os.makedirs("export", exist_ok=True)
@@ -879,6 +881,7 @@ class SignalsView_subwindow(BaseModule):
     # -------------------------------------------------------------------------
 
     def set_current_table_timestamp_list(self, timestamp_list):
+        """timestamp_list — список Unix ms."""
         self.current_current_table_timestamp_list = timestamp_list
         self.update_button_states()
         if timestamp_list:
@@ -893,10 +896,11 @@ class SignalsView_subwindow(BaseModule):
         self.recNumEdit.setText(str(rec_num))
         self.update_button_states()
 
-    def set_current_rec_num_by_timestamp(self, timestamp):
+    def set_current_rec_num_by_timestamp(self, timestamp_ms):
+        """Ищет ближайший timestamp (Unix ms) в списке и устанавливает rec_num."""
         if not self.current_current_table_timestamp_list:
             return
-        diffs = [abs(ts - timestamp) for ts in self.current_current_table_timestamp_list]
+        diffs = [abs(ts - timestamp_ms) for ts in self.current_current_table_timestamp_list]
         idx = int(np.argmin(diffs))
         self.set_current_rec_num(idx + 1)
         self.select_and_plot_record(idx + 1)
@@ -926,14 +930,15 @@ class SignalsView_subwindow(BaseModule):
         self.savePointsButton.setEnabled(has_data and bool(self.current_data))
 
     def send_timestamp_to_trends(self):
+        """Передаёт Unix timestamp (ms) в trends_view."""
         if not self.current_data or 'timestamp' not in self.current_data:
             self.on_error_message("Нет выбранной записи для передачи")
             return
 
-        timestamp = self.current_data["timestamp"]
+        timestamp_ms = self.current_data["timestamp"]  # уже Unix ms
         if self.bus:
-            self.bus.publish("signals.timestamp", timestamp)
-        self.timestamp_changed.emit(timestamp)
+            self.bus.publish("signals.timestamp", timestamp_ms)
+        self.timestamp_changed.emit(timestamp_ms)
 
     # -------------------------------------------------------------------------
     # ПРИМЕНЕНИЕ МАСШТАБА ТОКА
@@ -964,11 +969,18 @@ class SignalsView_subwindow(BaseModule):
             self.set_colname_list(colname_list)
             self.set_current_data(in_data)
 
-            # Получаем timestamp
-            timestamp = in_data.get("timestamp", 0)
-            time_to_display = pdb.datetime_from_timestamp(timestamp)
+            # Получаем datetime_str из CSV или конвертируем из timestamp (Unix ms)
+            timestamp_ms = in_data.get("timestamp", 0)  # Unix ms
+            datetime_str = in_data.get("datetime_str", "")
+            if datetime_str:
+                # Форматируем ISO строку: 2026-06-13T12:33:52.714 -> 2026-06-13 12:33:52
+                display_str = str(datetime_str)[:19].replace('T', ' ')
+            else:
+                # Fallback: конвертируем из Unix ms
+                timestamp_sec = timestamp_ms / 1000.0
+                display_str = datetime.datetime.fromtimestamp(timestamp_sec).strftime('%Y-%m-%d %H:%M:%S')
             self.timeEdit.blockSignals(True)
-            self.timeEdit.setText(str(time_to_display)[:-3])
+            self.timeEdit.setText(display_str)
             self.timeEdit.blockSignals(False)
 
             self.set_current_rec_num(rec_num)
@@ -1056,7 +1068,7 @@ class SignalsView_subwindow(BaseModule):
             # === ИСПРАВЛЕНИЕ: не сбрасываем масштаб, а применяем сохранённый ===
             self.apply_current_scale()
 
-            self.timestamp_changed.emit(timestamp)
+            self.timestamp_changed.emit(timestamp_ms)  # Unix ms
             self.send_timestamp_to_trends()
 
             logging.info("Графики успешно построены")
@@ -1174,14 +1186,25 @@ class SignalsView_subwindow(BaseModule):
 
     def show_datetime_dialog(self, event=None):
         initial_datetime = None
-        if self.current_data and "timestamp" in self.current_data:
-            initial_datetime = pdb.datetime_from_timestamp(self.current_data["timestamp"])
+        if self.current_data:
+            # Пробуем использовать исходную строку datetime из CSV
+            dt_str = self.current_data.get("datetime_str", "")
+            if dt_str:
+                try:
+                    initial_datetime = datetime.datetime.fromisoformat(str(dt_str).replace('Z', '+00:00'))
+                except Exception:
+                    pass
+            # Fallback: конвертируем из Unix ms
+            if initial_datetime is None and "timestamp" in self.current_data:
+                ts_ms = self.current_data["timestamp"]
+                ts_sec = ts_ms / 1000.0
+                initial_datetime = datetime.datetime.fromtimestamp(ts_sec)
 
         dialog = DateTimeSelectionDialog(initial_datetime, self)
 
         if dialog.exec():
             selected_dt = dialog.get_selected_datetime()
-            timestamp = int(selected_dt.toSecsSinceEpoch() * 1000)
+            timestamp_ms = int(selected_dt.toSecsSinceEpoch() * 1000)  # Unix ms
 
             if len(self.current_current_table_timestamp_list) < 1:
                 self.on_error_message("Нет выбранного устройства или списка записей")
@@ -1192,7 +1215,7 @@ class SignalsView_subwindow(BaseModule):
                 self.on_error_message("Список записей пуст")
                 return
 
-            closest_timestamp = min(timestamp_list, key=lambda x: abs(x - timestamp))
+            closest_timestamp = min(timestamp_list, key=lambda x: abs(x - timestamp_ms))
             closest_index = timestamp_list.index(closest_timestamp) + 1
 
             self.set_current_rec_num(closest_index)
@@ -1267,13 +1290,21 @@ class SignalsView_subwindow(BaseModule):
     def resizeEvent(self, event):
         super().resizeEvent(event)
 
-    def set_timestamp_from_trends(self, timestamp):
+    def set_timestamp_from_trends(self, timestamp_ms):
+        """Устанавливает запись по Unix timestamp (ms) из trends."""
         if self.current_device and self.current_current_table_timestamp_list:
-            closest_timestamp = min(self.current_current_table_timestamp_list, key=lambda x: abs(x - timestamp))
+            closest_timestamp = min(self.current_current_table_timestamp_list, key=lambda x: abs(x - timestamp_ms))
             closest_index = self.current_current_table_timestamp_list.index(closest_timestamp) + 1
             self.set_current_rec_num(closest_index)
             self.select_and_plot_record(closest_index)
-            self.timeEdit.setText(pdb.datetime_from_timestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'))
+            # Пробуем найти datetime_str для отображения
+            if self.current_data and "datetime_str" in self.current_data:
+                dt_str = self.current_data.get("datetime_str", "")
+                display_str = str(dt_str)[:19].replace('T', ' ') if dt_str else ""
+                self.timeEdit.setText(display_str)
+            else:
+                ts_sec = timestamp_ms / 1000.0
+                self.timeEdit.setText(datetime.datetime.fromtimestamp(ts_sec).strftime('%Y-%m-%d %H:%M:%S'))
             if hasattr(self.parent, 'status_bar'):
                 self.parent.status_bar.showMessage(
-                    f"Загрузка сигнала на {pdb.datetime_from_timestamp(timestamp).strftime('%d.%m.%Y %H:%M:%S')}", 5000)
+                    f"Загрузка сигнала на {datetime.datetime.fromtimestamp(timestamp_ms / 1000.0).strftime('%d.%m.%Y %H:%M:%S')}", 5000)

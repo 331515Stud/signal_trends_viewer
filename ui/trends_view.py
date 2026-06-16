@@ -102,6 +102,56 @@ def adc_to_amps(adc_shifted: np.ndarray, mult: float, div: float) -> np.ndarray:
 
 
 # =============================================================================
+# УТИЛИТА ПАРСИНГА TIMESTAMP (единая для всего проекта)
+# =============================================================================
+def parse_timestamp_to_ms(value) -> int:
+    """
+    Универсальный парсинг timestamp в миллисекунды.
+    Поддерживает:
+    - Числа (int, float) - Unix timestamp в мс
+    - Строки ISO 8601 (например, '2026-06-09T17:10:01.075')
+    - Строки с числами
+    """
+    if pd.isna(value):
+        return 0
+
+    # Если уже число
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    # Пробуем как число из строки
+    try:
+        return int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        pass
+
+    # Пробуем как ISO 8601 дату
+    try:
+        dt = pd.to_datetime(value)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        pass
+
+    return 0
+
+
+def parse_timestamps_column(series: pd.Series) -> pd.Series:
+    """
+    Универсальный парсинг колонки timestamp в миллисекунды.
+    """
+    # Сначала пробуем как числа
+    numeric = pd.to_numeric(series, errors='coerce')
+
+    # Для тех, что не распарсились как числа, пробуем как даты
+    mask_na = numeric.isna()
+    if mask_na.any():
+        parsed_dates = pd.to_datetime(series[mask_na], errors='coerce')
+        numeric[mask_na] = (parsed_dates.astype('int64') // 10**6)
+
+    return numeric.fillna(0).astype('int64')
+
+
+# =============================================================================
 # ПОТОК ЗАГРУЗКИ ДАННЫХ ИЗ БД (legacy, оставлен для совместимости)
 # =============================================================================
 class DataLoaderThread(QThread):
@@ -186,8 +236,18 @@ class DataLoaderThread(QThread):
             volts = np.round(adc_shift[:, :3] * scale_volt, 2)
             amps = np.round(adc_shift[:, 3:] * scale_curr, 2)
 
+            # Для БД: timestamp уже в Unix ms, формируем datetime_str для отображения
+            datetime_strs = []
+            for ts in timestamps:
+                try:
+                    dt_str = datetime.fromtimestamp(ts / 1000.0).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    datetime_strs.append(dt_str)
+                except:
+                    datetime_strs.append('')
+
             df = pd.DataFrame({
                 'timestamp': timestamps,
+                'datetime_str': datetime_strs,
                 'U_A_rms': volts[:, 0],
                 'U_B_rms': volts[:, 1],
                 'U_C_rms': volts[:, 2],
@@ -262,39 +322,28 @@ class CsvV2LoaderThread(QThread):
             t0 = time.perf_counter()
             df = pd.DataFrame()
 
-            # timestamp: УНИВЕРСАЛЬНАЯ КОНВЕРТАЦИЯ
-            # Поддержка: Unix ms (число) и ISO 8601 строки
+            # timestamp: сохраняем исходную строку как datetime_str,
+            # и конвертируем в Unix ms для внутреннего использования (единая система)
             ts_values = df_raw['timestamp'].astype(str).str.strip()
+            df['datetime_str'] = ts_values  # ИСХОДНАЯ СТРОКА — источник правды для отображения
 
-            # Сначала пробуем как числа
-            ts_numeric = pd.to_numeric(ts_values, errors='coerce')
-            mask_na = ts_numeric.isna()
-
-            if mask_na.any():
-                date_strings = ts_values[mask_na]
-                parsed_dates = pd.to_datetime(date_strings, errors='coerce')
-                ts_from_dates = (parsed_dates.astype('int64') // 10 ** 6)
-                ts_numeric.loc[mask_na] = ts_from_dates.values
-
-            df['timestamp'] = ts_numeric
+            # Единая конвертация в Unix ms через универсальный парсер
+            # (для синхронизации между окнами и позиционирования курсора)
+            df['timestamp'] = parse_timestamps_column(ts_values)
 
             # RMS значения: заменяем запятую на точку, потом в число
             rms_cols = ['U_A_rms', 'U_B_rms', 'U_C_rms', 'I_A_rms', 'I_B_rms', 'I_C_rms']
             for col in rms_cols:
-                # Замена запятой на точку для русской локали
                 df[col] = pd.to_numeric(
                     df_raw[col].astype(str).str.replace(',', '.', regex=False),
                     errors='coerce'
                 )
 
-            # Теперь можно безопасно конвертировать timestamp в int64
-            df['timestamp'] = df['timestamp'].astype('int64')
-
             # Округляем RMS до 2 знаков
             for col in rms_cols:
                 df[col] = df[col].round(2)
 
-            if len(df) == 0:
+            if len(df) == 0 or df['timestamp'].isna().all():
                 self.error_occurred.emit("CSV не содержит валидных записей (все timestamp/RMS = NaN)")
                 return
 
@@ -349,7 +398,7 @@ class CsvV2LoaderThread(QThread):
             df = df.sort_values('timestamp').reset_index(drop=True)
 
             # --- Финальная подготовка ---
-            output_cols = ['timestamp', 'U_A_rms', 'U_B_rms', 'U_C_rms',
+            output_cols = ['timestamp', 'datetime_str', 'U_A_rms', 'U_B_rms', 'U_C_rms',
                            'I_A_rms', 'I_B_rms', 'I_C_rms']
 
             # Метаданные
@@ -427,6 +476,64 @@ class GapRegion(pg.GraphicsObject):
         p.drawRect(self.boundingRect())
 
 
+class DateTimeAxisItem(pg.AxisItem):
+    """
+    AxisItem, который отображает время из datetime_str (источник правды — CSV).
+    Ось X работает в секундах с эпохи (для синхронизации курсоров),
+    но подписи тиков берутся из datetime_str по ближайшему индексу.
+    """
+
+    def __init__(self, orientation='bottom', datetime_strs=None, **kwargs):
+        super().__init__(orientation=orientation, **kwargs)
+        self._datetime_strs = datetime_strs or []
+        self._ts_sec_values = []  # Параллельный массив секунд с эпохи
+
+    def set_datetime_strs(self, strs):
+        self._datetime_strs = strs
+
+    def set_ts_sec_values(self, ts_sec_list):
+        self._ts_sec_values = ts_sec_list
+
+    def tickStrings(self, values, scale, spacing):
+        """
+        values — это позиции на оси X (секунды с эпохи).
+        Находим ближайший индекс в _ts_sec_values и берём datetime_str.
+        """
+        result = []
+        if not self._ts_sec_values or not self._datetime_strs:
+            return result
+
+        ts_arr = np.array(self._ts_sec_values, dtype=float)
+        for v in values:
+            try:
+                v = float(v)
+                # Находим ближайший индекс
+                idx = np.searchsorted(ts_arr, v)
+                if idx == 0:
+                    best_idx = 0
+                elif idx >= len(ts_arr):
+                    best_idx = len(ts_arr) - 1
+                else:
+                    # Выбираем ближайший из двух соседей
+                    if abs(ts_arr[idx] - v) < abs(ts_arr[idx - 1] - v):
+                        best_idx = idx
+                    else:
+                        best_idx = idx - 1
+
+                dt_str = str(self._datetime_strs[best_idx])
+                # Берём только время: "2026-06-14 22:11:49" → "22:11:49"
+                if ' ' in dt_str:
+                    time_part = dt_str.split(' ')[-1][:8]
+                elif 'T' in dt_str:
+                    time_part = dt_str.split('T')[-1][:8]
+                else:
+                    time_part = dt_str[:8]
+                result.append(time_part)
+            except (ValueError, IndexError):
+                result.append('')
+        return result
+
+
 class PlotContainer(QWidget):
     def __init__(self, columns, y_ranges):
         super().__init__()
@@ -460,7 +567,8 @@ class PlotContainer(QWidget):
             except:
                 pass
 
-            axis = pg.DateAxisItem(orientation='bottom')
+            # Кастомный AxisItem — показывает время из datetime_str (CSV)
+            axis = DateTimeAxisItem(orientation='bottom')
             pw.setAxisItems({'bottom': axis})
 
             self.layout.addWidget(pw)
@@ -507,13 +615,14 @@ class TrendsSubwindow(BaseModule):
         self.setMinimumWidth(300)
 
         self.all_data = pd.DataFrame()
-        self.time_labels = []
-        self.valid_data_indices = []
-        self.all_time_labels = []
-        self.all_valid_indices = []
+        self.time_labels = []  # Unix timestamp в секундах (float) для каждой валидной записи
+        self.valid_data_indices = []  # Индексы в all_data для валидных записей
+        self.all_time_labels = []  # Копия time_labels
+        self.all_valid_indices = []  # Копия valid_data_indices
+        self.datetime_strs = []  # ИСХОДНЫЕ СТРОКИ из CSV — для отображения
         self.current_device = None
         self.data_loader = None
-        self.pending_timestamps = []
+        self.pending_timestamps = []  # Ожидающие Unix ms
         self.is_loading = False
         self.lock_cursor_mode = False
 
@@ -730,19 +839,25 @@ class TrendsSubwindow(BaseModule):
         profiler.end("clear_plots")
 
         profiler.start("prepare_timestamps")
-        timestamps = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
-        valid_mask = timestamps.notna().to_numpy()
+        # Единая система: timestamp в Unix ms -> секунды с эпохи для оси X
+        timestamps_ms = df['timestamp'].to_numpy(dtype='int64')
+        valid_mask = ~np.isnan(timestamps_ms) & (timestamps_ms > 0)
+
         if not valid_mask.any():
             return
 
-        ts_sec = timestamps.astype('int64') / 1e9
-        ts_valid = ts_sec[valid_mask].astype(float)
+        # Ось X в секундах с эпохи (Unix timestamp) — для курсоров и синхронизации
+        ts_sec = timestamps_ms[valid_mask].astype(float) / 1000.0
         df_valid = df.iloc[np.nonzero(valid_mask)[0]].reset_index(drop=True)
+
+        # Сохраняем datetime_str для отображения — ИСТОЧНИК ПРАВДЫ из CSV
+        self.datetime_strs = df_valid['datetime_str'].tolist() if 'datetime_str' in df_valid.columns else []
+
         profiler.end("prepare_timestamps")
 
         profiler.start("find_gaps")
-        if len(ts_valid) >= 2:
-            diffs = np.diff(ts_valid)
+        if len(ts_sec) >= 2:
+            diffs = np.diff(ts_sec)
             gap_idx = np.where(diffs > 900)[0]  # разрыв > 15 минут
         else:
             gap_idx = np.array([], dtype=int)
@@ -751,9 +866,9 @@ class TrendsSubwindow(BaseModule):
         profiler.start("build_plots")
         if gap_idx.size:
             insert_positions = (gap_idx + 1)
-            ts2 = np.insert(ts_valid, insert_positions, np.nan)
+            ts2 = np.insert(ts_sec, insert_positions, np.nan)
         else:
-            ts2 = ts_valid
+            ts2 = ts_sec
 
         for col in self.plot_container.columns:
             y = df_valid[col].to_numpy(dtype=float)
@@ -767,15 +882,21 @@ class TrendsSubwindow(BaseModule):
             pw.addItem(item)
             self.plot_container.plot_items[col].append(item)
 
+            # Передаём datetime_str и ts_sec в AxisItem для отображения
+            axis = pw.getAxis('bottom')
+            if isinstance(axis, DateTimeAxisItem):
+                axis.set_datetime_strs(self.datetime_strs)
+                axis.set_ts_sec_values(ts_sec.tolist())
+
             for g in gap_idx:
-                if g + 1 < len(ts_valid):
-                    t1 = ts_valid[g]
-                    t2 = ts_valid[g + 1]
+                if g + 1 < len(ts_sec):
+                    t1 = ts_sec[g]
+                    t2 = ts_sec[g + 1]
                     pw.addItem(GapRegion(t1, t2))
         profiler.end("build_plots")
 
         profiler.start("set_ranges")
-        self.all_time_labels = ts_valid.tolist()
+        self.all_time_labels = ts_sec.tolist()  # Unix timestamp в секундах
         self.all_valid_indices = np.nonzero(valid_mask)[0].tolist()
 
         if self.all_time_labels:
@@ -844,9 +965,10 @@ class TrendsSubwindow(BaseModule):
         self.update_values()
 
     def send_timestamp_to_signals(self):
+        """Передаёт Unix timestamp (ms) в signals_view."""
         try:
-            pos = self.plot_container.cursors[self.plot_container.columns[0]].value()
-            ts_ms = int(pos * 1000)
+            pos_sec = self.plot_container.cursors[self.plot_container.columns[0]].value()
+            ts_ms = int(pos_sec * 1000)  # секунды -> миллисекунды
             if self.bus:
                 self.bus.publish("trends.cursor.timestamp", ts_ms)
         except:
@@ -864,21 +986,24 @@ class TrendsSubwindow(BaseModule):
             self.set_cursor_to_timestamp(self.pending_timestamps.pop(0))
 
     def set_cursor_to_timestamp(self, timestamp_ms):
+        """
+        Устанавливает курсор на позицию, соответствующую Unix timestamp (ms).
+        """
         if self.is_loading:
             self.pending_timestamps.append(timestamp_ms)
             return
         if self.all_data.empty or not self.all_time_labels:
             return
         try:
-            target = timestamp_ms / 1000.0
-            arr = np.array(self.all_time_labels, dtype=float)
-            idx = np.searchsorted(arr, target)
+            target_sec = timestamp_ms / 1000.0  # конвертируем ms -> секунды
+            arr = np.array(self.all_time_labels, dtype=float)  # секунды с эпохи
+            idx = np.searchsorted(arr, target_sec)
             if idx == 0:
                 pos = arr[0]
             elif idx >= len(arr):
                 pos = arr[-1]
             else:
-                pos = arr[idx] if abs(arr[idx] - target) < abs(arr[idx - 1] - target) else arr[idx - 1]
+                pos = arr[idx] if abs(arr[idx] - target_sec) < abs(arr[idx - 1] - target_sec) else arr[idx - 1]
 
             for c in self.plot_container.cursors.values():
                 c.blockSignals(True)
@@ -890,19 +1015,23 @@ class TrendsSubwindow(BaseModule):
             logging.exception("set_cursor_to_timestamp error")
 
     def update_values(self):
+        """
+        Обновляет значения под графиками.
+        Время отображается ИСКЛЮЧИТЕЛЬНО из datetime_str (CSV) — источник правды.
+        """
         start = time.perf_counter()
         try:
             if self.all_data.empty or not self.all_time_labels:
                 return
-            pos = self.plot_container.cursors[self.plot_container.columns[0]].value()
+            pos_sec = self.plot_container.cursors[self.plot_container.columns[0]].value()
             arr = np.array(self.all_time_labels, dtype=float)
-            idx = np.searchsorted(arr, pos)
+            idx = np.searchsorted(arr, pos_sec)
             if idx == 0:
                 idx = 0
             elif idx >= len(arr):
                 idx = len(arr) - 1
             else:
-                if abs(arr[idx] - pos) >= abs(arr[idx - 1] - pos):
+                if abs(arr[idx] - pos_sec) >= abs(arr[idx - 1] - pos_sec):
                     idx = idx - 1
 
             if idx >= len(self.all_valid_indices):
@@ -910,8 +1039,18 @@ class TrendsSubwindow(BaseModule):
             data_idx = self.all_valid_indices[idx]
             row = self.all_data.iloc[data_idx]
 
-            ts_sec = row['timestamp'] / 1000.0
-            self.datetime_label.setText(f"Дата/время: {datetime.fromtimestamp(ts_sec):%Y-%m-%d %H:%M:%S}")
+            # === ИСТОЧНИК ПРАВДЫ: datetime_str из CSV ===
+            dt_str = row.get('datetime_str', '')
+            if pd.notna(dt_str) and dt_str:
+                # Просто заменяем T на пробел, никаких конвертаций timezone
+                display_str = str(dt_str).replace('T', ' ')
+                self.datetime_label.setText(f"Дата/время: {display_str}")
+            else:
+                # Fallback только если нет datetime_str
+                ts_ms = row['timestamp']
+                ts_sec = ts_ms / 1000.0
+                # Используем utcfromtimestamp, чтобы не было смещения timezone
+                self.datetime_label.setText(f"Дата/время: {datetime.utcfromtimestamp(ts_sec):%d.%m.%Y %H:%M:%S}")
 
             labels_map = [
                 ('U_A_rms', self.u_a_label, "V"),
@@ -940,6 +1079,7 @@ class TrendsSubwindow(BaseModule):
         self.valid_data_indices = []
         self.all_time_labels = []
         self.all_valid_indices = []
+        self.datetime_strs = []
         self.pending_timestamps = []
         self.is_loading = False
         self.plot_container.clear_plots()
@@ -957,6 +1097,7 @@ class TrendsSubwindow(BaseModule):
         msg.exec()
 
     def on_signal_timestamp(self, timestamp_ms):
+        """Получен timestamp (Unix ms) из signals_view."""
         self.set_cursor_to_timestamp(timestamp_ms)
 
     def on_record_selected(self, payload):
