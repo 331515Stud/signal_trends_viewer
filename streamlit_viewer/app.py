@@ -29,6 +29,8 @@ if "active_session_name" not in st.session_state:
     st.session_state.active_session_name = None
 if "active_dataset_name" not in st.session_state:
     st.session_state.active_dataset_name = None
+if "y_range_amperes" not in st.session_state:
+    st.session_state.y_range_amperes = 0
 
 render_sidebar()
 

@@ -26,6 +26,7 @@ def render_trend_charts(df, x, rms_cols, theme):
     show_grid = st.session_state.show_grid
     lock_x = st.session_state.lock_x
     lock_y = st.session_state.lock_y
+    y_range_amp = st.session_state.get("y_range_amperes", 0)
 
     tick_interval = max(1, len(x) // 10)
     tickvals = x[::tick_interval]
@@ -39,13 +40,18 @@ def render_trend_charts(df, x, rms_cols, theme):
 
         cursor_y = float(np.interp(cursor_x, x, y_full))
 
-        y_min = float(np.min(y_full))
-        y_max = float(np.max(y_full))
-        pad = (y_max - y_min) * 0.1
-        if pad == 0:
-            pad = 1
-        y_min -= pad
-        y_max += pad
+        is_current = "I_" in col or "i_" in col
+        if y_range_amp > 0 and is_current:
+            y_min = -float(y_range_amp)
+            y_max = float(y_range_amp)
+        else:
+            y_min_full = float(np.min(y_full))
+            y_max_full = float(np.max(y_full))
+            pad = (y_max_full - y_min_full) * 0.1
+            if pad == 0:
+                pad = 1
+            y_min = y_min_full - pad
+            y_max = y_max_full + pad
 
         fig = go.Figure()
 
@@ -96,7 +102,7 @@ def render_trend_charts(df, x, rms_cols, theme):
             fig, key=f"plot_{idx}",
             on_select="rerun",
             width="stretch",
-            config={"scrollZoom": False, "displayModeBar": False},
+            config={"scrollZoom": not lock_x, "displayModeBar": not lock_x},
         )
 
         try:

@@ -29,6 +29,7 @@ def render_oscillograms(df, x, signal_cols, theme):
     lock_y = st.session_state.lock_y
     freq_min = st.session_state.freq_min
     freq_max = st.session_state.freq_max
+    y_range_amp = st.session_state.get("y_range_amperes", 0)
 
     nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 1, 1, 3])
     with nav1:
@@ -87,7 +88,7 @@ def render_oscillograms(df, x, signal_cols, theme):
         sig_data = physical_signals.get(sig_col)
 
         if sig_data is not None:
-            _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_grid, lock_x, lock_y, freq_min, freq_max)
+            _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_grid, lock_x, lock_y, freq_min, freq_max, y_range_amp)
         else:
             _render_empty_charts(sig_col, theme, show_grid, lock_x, lock_y)
 
@@ -95,7 +96,7 @@ def render_oscillograms(df, x, signal_cols, theme):
         _render_batch_export(selected_channels, physical_signals, cursor_idx, x)
 
 
-def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_grid, lock_x, lock_y, freq_min, freq_max):
+def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_grid, lock_x, lock_y, freq_min, freq_max, y_range_amp):
     signal = sig_data["signal"]
     unit = sig_data["unit"]
 
@@ -103,6 +104,15 @@ def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_g
 
     with col_sig:
         t = np.linspace(0, len(signal) / DEFAULT_SAMPLE_RATE, len(signal)) * 1000
+
+        is_current = "I_" in sig_col or "i_" in sig_col
+        if y_range_amp > 0 and is_current:
+            sig_y_min = -float(y_range_amp)
+            sig_y_max = float(y_range_amp)
+        else:
+            sig_y_min = float(np.min(signal))
+            sig_y_max = float(np.max(signal))
+
         fig_sig = go.Figure()
         fig_sig.add_trace(go.Scatter(x=t, y=signal, mode="lines",
                                      line=dict(color=theme["line_colors"][0], width=1)))
@@ -117,12 +127,13 @@ def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_g
                        tickfont=dict(color=theme["text"]),
                        title_font=dict(color=theme["text"])),
             yaxis=dict(gridcolor=theme["grid"], showgrid=show_grid,
-                       fixedrange=lock_y,
+                       fixedrange=lock_y, range=[sig_y_min, sig_y_max],
                        tickfont=dict(color=theme["text"]),
                        title_font=dict(color=theme["text"])),
             margin=dict(t=40, b=40),
         )
-        st.plotly_chart(fig_sig, width="stretch")
+        st.plotly_chart(fig_sig, width="stretch",
+                        config={"scrollZoom": not lock_x, "displayModeBar": not lock_x})
 
     with col_spec:
         sig = signal.astype(float) - np.mean(signal.astype(float))
@@ -131,9 +142,14 @@ def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_g
         fr = np.fft.rfftfreq(N, 1 / DEFAULT_SAMPLE_RATE)
 
         mask = (fr >= freq_min) & (fr <= freq_max)
+        fr_masked = fr[mask]
+        yf_masked = yf[mask]
+
+        spec_y_min = float(np.min(yf_masked)) if len(yf_masked) > 0 else 0
+        spec_y_max = float(np.max(yf_masked)) if len(yf_masked) > 0 else 1
 
         fig_spec = go.Figure()
-        fig_spec.add_trace(go.Scatter(x=fr[mask], y=yf[mask], mode="lines",
+        fig_spec.add_trace(go.Scatter(x=fr_masked, y=yf_masked, mode="lines",
                                       line=dict(color=theme["line_colors"][1], width=1)))
         fig_spec.update_layout(
             title=f"{sig_col} {_MDASH} Спектр", height=200,
@@ -151,7 +167,8 @@ def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_g
                        title_font=dict(color=theme["text"])),
             margin=dict(t=40, b=40),
         )
-        st.plotly_chart(fig_spec, width="stretch")
+        st.plotly_chart(fig_spec, width="stretch",
+                        config={"scrollZoom": not lock_x, "displayModeBar": not lock_x})
 
     timestamp_ms = x[cursor_idx]
     dt_str = datetime.utcfromtimestamp(timestamp_ms / 1000).strftime('%Y%m%d_%H%M%S')
@@ -166,7 +183,7 @@ def _render_signal_with_spectrum(sig_col, sig_data, cursor_idx, x, theme, show_g
     )
 
 
-def _render_empty_charts(sig_col, theme, show_grid, lock_x, lock_y):
+def _render_empty_charts(sig_col, theme, show_grid, lock_x, lock_y, zoom_factor, zoom_x_factor):
     col_sig, col_spec = st.columns(2)
     with col_sig:
         fig_empty = go.Figure()
@@ -185,7 +202,8 @@ def _render_empty_charts(sig_col, theme, show_grid, lock_x, lock_y):
                        title_font=dict(color=theme["text"])),
             margin=dict(t=40, b=40),
         )
-        st.plotly_chart(fig_empty, width="stretch")
+        st.plotly_chart(fig_empty, width="stretch",
+                        config={"scrollZoom": not lock_x, "displayModeBar": not lock_x})
     with col_spec:
         fig_empty_spec = go.Figure()
         fig_empty_spec.update_layout(
@@ -203,7 +221,8 @@ def _render_empty_charts(sig_col, theme, show_grid, lock_x, lock_y):
                        title_font=dict(color=theme["text"])),
             margin=dict(t=40, b=40),
         )
-        st.plotly_chart(fig_empty_spec, width="stretch")
+        st.plotly_chart(fig_empty_spec, width="stretch",
+                        config={"scrollZoom": not lock_x, "displayModeBar": not lock_x})
 
 
 def _render_batch_export(selected_channels, physical_signals, cursor_idx, x):

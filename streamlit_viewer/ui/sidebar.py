@@ -19,6 +19,12 @@ def render_sidebar():
         st.checkbox("\U0001f512 Фикс X", value=True, key="lock_x")
         st.checkbox("\U0001f512 Фикс Y", value=True, key="lock_y")
 
+        st.number_input(
+            "Диапазон тока (А)", min_value=0, max_value=10000, value=0, step=1,
+            key="y_range_amperes",
+            help="0 = автоматический масштаб. Задайте значение для фиксированного диапазона (например 20 → от -20 до 20 А). Влияет только на каналы тока (I_*)",
+        )
+
         st.divider()
         st.subheader("Фильтр частот")
         st.number_input("Мин. частота (Гц)", 0, 12800, 0, key="freq_min")
