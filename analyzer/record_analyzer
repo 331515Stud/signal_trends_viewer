@@ -403,12 +403,12 @@ def analyze_dataset_folder(
     anomaly_min_quality: float = 0.0,
     outlier_percentile: float = 97.5,
 ) -> dict:
-    raw_csv = dataset_folder / "raw.csv"
-    if not raw_csv.exists():
-        return {"error": f"raw.csv not found in {dataset_folder}"}
+    raw_csv = find_raw_csv(dataset_folder)
+    if raw_csv is None:
+        return {"error": f"No raw CSV file with required columns found in {dataset_folder}"}
 
     chunks = parse_raw_csv(raw_csv)
-    print(f"Loaded {len(chunks)} chunks")
+    print(f"Loaded {len(chunks)} chunks from {raw_csv.name}")
 
     features = [feat for chunk in chunks
                 if (feat := extract_raw_features(chunk)) is not None]
@@ -490,6 +490,7 @@ def analyze_dataset_folder(
         "n_anomalies_kept": n_anomalies_kept,
         "n_normal_kept": n_normal_kept,
         "selected_ids": selected_ids,
+        "source_csv": raw_csv.name,
     }
 
 
@@ -521,6 +522,32 @@ def save_filtered_csv(
     return output_path
 
 
+def find_raw_csv(dataset_folder: Path) -> Optional[Path]:
+    for f in sorted(dataset_folder.glob("*.csv")):
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                sample = fh.read(4096)
+                if "chunkID" in sample and "U_A_signal" in sample:
+                    return f
+        except Exception:
+            continue
+    return None
+
+
+def resolve_dataset_folder(input_path: str) -> Path:
+    p = Path(input_path)
+    if p.is_dir():
+        return p
+    if p.is_file():
+        return p.parent
+    if p.exists():
+        return p.parent if p.suffix else p
+    parent = p.parent
+    if parent.exists():
+        return parent
+    raise FileNotFoundError(f"Path not found: {input_path}")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -530,13 +557,20 @@ if __name__ == "__main__":
     ANOMALY_MIN_QUALITY = 0.0
     OUTLIER_PERCENTILE = 97.5
 
-    csv_file = Path(CSV_PATH)
-    if not csv_file.exists():
-        print(f"Error: File not found: {CSV_PATH}")
+    try:
+        folder = resolve_dataset_folder(CSV_PATH)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
-    folder = csv_file.parent
     print(f"Dataset folder: {folder}")
+
+    raw_csv = find_raw_csv(folder)
+    if raw_csv is None:
+        print(f"Error: No raw CSV file with required columns found in {folder}")
+        sys.exit(1)
+
+    print(f"Using raw CSV: {raw_csv.name}")
 
     result = analyze_dataset_folder(
         folder,
@@ -547,7 +581,7 @@ if __name__ == "__main__":
     )
 
     if "selected_ids" in result and result["selected_ids"]:
-        output_path = csv_file.parent / "raw_filtered.csv"
-        save_filtered_csv(csv_file, result["selected_ids"], output_path)
+        output_path = folder / "raw_filtered.csv"
+        save_filtered_csv(raw_csv, result["selected_ids"], output_path)
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
